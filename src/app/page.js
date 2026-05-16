@@ -17,6 +17,7 @@ const TABS = [
   { id:"pest",   label:"PEST",   icon:"◈", color:"#a78bfa", endpoint:"/analyze-pest",    model:"YOLOv8",  mode:"PEST DETECT",    scanMsg:"Running YOLOv8 pest detection",      idleMsg:"UPLOAD CROP / FIELD IMAGE"  },
   { id:"wheat",  label:"WHEAT",  icon:"◇", color:"#facc15", endpoint:"/analyze-wheat",   model:"YOLOv8",  mode:"WHEAT DISEASE",  scanMsg:"Running YOLOv8 on wheat leaf image", idleMsg:"UPLOAD WHEAT LEAF IMAGE"    },
   { id:"corn",   label:"CORN",   icon:"△", color:"#4ade80", endpoint:"/analyze-corn",    model:"YOLOv8",  mode:"CORN DISEASE",   scanMsg:"Running YOLOv8 on corn leaf image",  idleMsg:"UPLOAD CORN LEAF IMAGE"     },
+  { id:"live",   label:"LIVE",   icon:"⬤", color:"#f43f5e", endpoint:"/live-frame",       model:"U-Net",   mode:"LIVE WEED",      scanMsg:"Analyzing live frame…",              idleMsg:"START LIVE SCAN"            },
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -220,19 +221,261 @@ function YoloResult({ result, tabColor, onRescan }) {
   );
 }
 
-// ── Splash screen ─────────────────────────────────────────────────────────────
-function SplashScreen({ onDone }) {
-  const [outerOpacity, setOuterOpacity] = useState(0);
-  const [showText,     setShowText]     = useState(false);
-  const [showSub,      setShowSub]      = useState(false);
+// ── Live Scan Tab Component ───────────────────────────────────────────────────
+function LiveScanTab({ onResult, tabColor, apiBase }) {
+  const videoRef    = useRef(null);
+  const canvasRef   = useRef(null);
+  const streamRef   = useRef(null);
+  const intervalRef = useRef(null);
+
+  const [mode,       setMode]       = useState("idle");   // idle | pi4 | webcam | scanning | result
+  const [pi4Url,     setPi4Url]     = useState("");
+  const [pi4Input,   setPi4Input]   = useState("");
+  const [pi4Stats,   setPi4Stats]   = useState(null);
+  const [liveResult, setLiveResult] = useState(null);
+  const [scanning,   setScanning]   = useState(false);
+  const [fps,        setFps]        = useState(0);
+  const [error,      setError]      = useState("");
+
+  // ── Stop everything on unmount ──────────────────────────────────────────────
   useEffect(() => {
-    const t1 = setTimeout(() => setOuterOpacity(1),  80);
-    const t2 = setTimeout(() => setShowText(true),  900);
-    const t3 = setTimeout(() => setShowSub(true),  1200);
-    const t4 = setTimeout(() => setOuterOpacity(0), 1700);
-    const t5 = setTimeout(() => onDone(),           2100);
-    return () => [t1,t2,t3,t4,t5].forEach(clearTimeout);
-  }, [onDone]);
+    return () => {
+      stopWebcam();
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  // ── Poll Pi4 stats every 2s when in pi4 mode ────────────────────────────────
+  useEffect(() => {
+    if (mode !== "pi4" || !pi4Url) return;
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(`${pi4Url}/stats`);
+        const data = await res.json();
+        setPi4Stats(data);
+      } catch {}
+    }, 2000);
+    return () => clearInterval(id);
+  }, [mode, pi4Url]);
+
+  function stopWebcam() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }
+
+  async function startWebcam() {
+    setError("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: "environment" }
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+      }
+      setMode("webcam");
+      setLiveResult(null);
+      // Auto-capture every 3 seconds
+      intervalRef.current = setInterval(() => captureAndAnalyze(), 3000);
+    } catch (e) {
+      setError("Camera access denied. Please allow camera in browser settings.");
+    }
+  }
+
+  async function captureAndAnalyze() {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video  = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    canvas.toBlob(async (blob) => {
+      if (!blob) return;
+      setScanning(true);
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+      try {
+        const res  = await axios.post(`${apiBase}/live-frame`, fd);
+        const data = res.data;
+        if (!data.error) {
+          setLiveResult(data);
+          onResult(data);
+        }
+      } catch {}
+      setScanning(false);
+    }, "image/jpeg", 0.85);
+  }
+
+  function connectPi4() {
+    let url = pi4Input.trim();
+    if (!url.startsWith("http")) url = "http://" + url;
+    if (!url.includes(":5000")) url = url + ":5000";
+    setPi4Url(url);
+    setMode("pi4");
+    setError("");
+  }
+
+  function reset() {
+    stopWebcam();
+    setMode("idle");
+    setLiveResult(null);
+    setPi4Stats(null);
+    setPi4Url("");
+    setPi4Input("");
+    setError("");
+  }
+
+  const sev = liveResult?.severity ?? pi4Stats?.severity ?? null;
+  const sevColor = { HEALTHY:"#16a34a", LOW:"#ca8a04", MODERATE:"#ea580c", CRITICAL:"#dc2626" }[sev] ?? tabColor;
+
+  // ── IDLE: choose mode ────────────────────────────────────────────────────────
+  if (mode === "idle") return (
+    <div style={{ width:"100%", height:"100%", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:24, padding:24 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+        <div style={{ width:10, height:10, borderRadius:"50%", background:tabColor, boxShadow:`0 0 8px ${tabColor}`, animation:"pulse 1.5s infinite" }}/>
+        <span style={{ fontSize:11, color:tabColor, letterSpacing:"0.2em" }}>LIVE SCAN MODE</span>
+      </div>
+
+      {error && <div style={{ fontSize:10, color:"#ef4444", textAlign:"center", maxWidth:280 }}>{error}</div>}
+
+      <div style={{ display:"flex", gap:14, flexWrap:"wrap", justifyContent:"center" }}>
+        {/* Pi4 option */}
+        <div style={{ width:200, padding:16, border:`1px solid #1e3a4a`, borderRadius:10, background:"#0a0a0a", textAlign:"center" }}>
+          <div style={{ fontSize:22, marginBottom:8 }}>🤖</div>
+          <div style={{ fontSize:10, color:"#06b6d4", fontWeight:700, letterSpacing:"0.15em", marginBottom:6 }}>RASPBERRY PI 4</div>
+          <div style={{ fontSize:9, color:"#334155", marginBottom:12, lineHeight:1.6 }}>Pi4 streams live annotated video. Enter Pi4 IP address.</div>
+          <input
+            value={pi4Input}
+            onChange={e => setPi4Input(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && connectPi4()}
+            placeholder="192.168.1.105"
+            style={{ width:"100%", padding:"6px 8px", background:"#111", border:"1px solid #1e3a4a", borderRadius:5, color:"#e2e8f0", fontSize:11, fontFamily:"monospace", outline:"none", boxSizing:"border-box", marginBottom:8 }}
+          />
+          <button onClick={connectPi4} disabled={!pi4Input.trim()} style={{ width:"100%", padding:"7px 0", background: pi4Input.trim()?"#06b6d4":"#111", border:"none", borderRadius:5, color: pi4Input.trim()?"#020e11":"#334155", fontSize:9, fontWeight:700, cursor: pi4Input.trim()?"pointer":"default", letterSpacing:"0.1em" }}>
+            CONNECT STREAM
+          </button>
+        </div>
+
+        {/* Webcam option */}
+        <div style={{ width:200, padding:16, border:`1px solid #2d1a2e`, borderRadius:10, background:"#0a0a0a", textAlign:"center" }}>
+          <div style={{ fontSize:22, marginBottom:8 }}>💻</div>
+          <div style={{ fontSize:10, color:tabColor, fontWeight:700, letterSpacing:"0.15em", marginBottom:6 }}>BROWSER WEBCAM</div>
+          <div style={{ fontSize:9, color:"#334155", marginBottom:12, lineHeight:1.6 }}>Use laptop/phone camera. Sends frames to AI backend every 3s.</div>
+          <button onClick={startWebcam} style={{ width:"100%", padding:"7px 0", background:tabColor, border:"none", borderRadius:5, color:"#020e11", fontSize:9, fontWeight:700, cursor:"pointer", letterSpacing:"0.1em" }}>
+            START WEBCAM
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── PI4 STREAM MODE ──────────────────────────────────────────────────────────
+  if (mode === "pi4") return (
+    <div style={{ width:"100%", height:"100%", display:"flex", flexDirection:"column", padding:16, gap:10 }}>
+      {/* Stream */}
+      <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", overflow:"hidden", position:"relative" }}>
+        <img
+          src={`${pi4Url}/video_feed`}
+          alt="Pi4 Live Stream"
+          style={{ maxHeight:"100%", maxWidth:"100%", borderRadius:6, objectFit:"contain", border:`1px solid ${tabColor}33` }}
+          onError={() => setError(`Cannot connect to Pi4 at ${pi4Url}. Check IP and that pi4_stream.py is running.`)}
+        />
+        {/* Live badge */}
+        <div style={{ position:"absolute", top:10, left:10, display:"flex", alignItems:"center", gap:5, background:"#000000bb", padding:"3px 8px", borderRadius:4 }}>
+          <div style={{ width:6, height:6, borderRadius:"50%", background:"#ef4444", animation:"pulse 1s infinite" }}/>
+          <span style={{ fontSize:9, color:"#ef4444", fontWeight:700, letterSpacing:"0.1em" }}>LIVE · Pi4</span>
+        </div>
+      </div>
+      {error && <div style={{ fontSize:9, color:"#ef4444" }}>{error}</div>}
+      {/* Pi4 stats bar */}
+      {pi4Stats && (
+        <div style={{ display:"flex", gap:16, alignItems:"center", flexWrap:"wrap" }}>
+          <div style={{ display:"flex", alignItems:"baseline", gap:6 }}>
+            <span style={{ fontSize:28, fontWeight:700, color:tabColor, lineHeight:1 }}>{pi4Stats.density}%</span>
+            <span style={{ fontSize:9, color: sevColor, fontWeight:700, border:`1px solid ${sevColor}`, padding:"1px 6px", borderRadius:3 }}>{pi4Stats.severity}</span>
+          </div>
+          <div style={{ fontSize:9, color:"#334155" }}>Herbicide: <span style={{ color:"#22c55e" }}>{pi4Stats.herbicide}</span></div>
+          <div style={{ fontSize:9, color:"#334155" }}>Latency: <span style={{ color:tabColor }}>{pi4Stats.latency}</span></div>
+          <div style={{ fontSize:9, color:"#334155" }}>FPS: <span style={{ color:"#a78bfa" }}>{pi4Stats.fps}</span></div>
+          <button onClick={reset} style={{ marginLeft:"auto", padding:"5px 12px", background:"transparent", border:`1px solid #1e3a4a`, borderRadius:5, color:"#475569", fontSize:9, cursor:"pointer", fontFamily:"inherit" }}>DISCONNECT</button>
+        </div>
+      )}
+    </div>
+  );
+
+  // ── BROWSER WEBCAM MODE ──────────────────────────────────────────────────────
+  return (
+    <div style={{ width:"100%", height:"100%", display:"flex", flexDirection:"column", padding:16, gap:10 }}>
+      <canvas ref={canvasRef} style={{ display:"none" }}/>
+
+      <div style={{ flex:1, display:"flex", gap:10, overflow:"hidden" }}>
+        {/* Live webcam feed */}
+        <div style={{ flex:1, position:"relative", overflow:"hidden", borderRadius:6, border:`1px solid #111` }}>
+          <video ref={videoRef} autoPlay muted playsInline style={{ width:"100%", height:"100%", objectFit:"cover", transform:"scaleX(-1)" }}/>
+          <div style={{ position:"absolute", top:8, left:8, display:"flex", alignItems:"center", gap:5, background:"#000000bb", padding:"3px 8px", borderRadius:4 }}>
+            <div style={{ width:6, height:6, borderRadius:"50%", background: scanning?"#f59e0b":"#ef4444", animation:"pulse 1s infinite" }}/>
+            <span style={{ fontSize:9, color: scanning?"#f59e0b":"#ef4444", fontWeight:700 }}>{scanning?"ANALYZING…":"LIVE · WEBCAM"}</span>
+          </div>
+        </div>
+
+        {/* Latest annotated result */}
+        {liveResult && (
+          <div style={{ flex:1, position:"relative", overflow:"hidden", borderRadius:6, border:`1px solid ${tabColor}33` }}>
+            <img src={liveResult.image} alt="Detection" style={{ width:"100%", height:"100%", objectFit:"cover" }}/>
+            <div style={{ position:"absolute", top:8, left:8, background:"#000000bb", padding:"3px 8px", borderRadius:4, fontSize:9, color:tabColor }}>AI OUTPUT</div>
+          </div>
+        )}
+      </div>
+
+      {/* Stats bar */}
+      <div style={{ display:"flex", alignItems:"center", gap:16, flexWrap:"wrap" }}>
+        {liveResult ? (
+          <>
+            <div style={{ display:"flex", alignItems:"baseline", gap:6 }}>
+              <span style={{ fontSize:28, fontWeight:700, color:tabColor, lineHeight:1 }}>{liveResult.percentage}%</span>
+              <span style={{ fontSize:9, color:sevColor, fontWeight:700, border:`1px solid ${sevColor}`, padding:"1px 6px", borderRadius:3 }}>{liveResult.severity}</span>
+            </div>
+            <div style={{ fontSize:9, color:"#334155" }}>Herbicide: <span style={{ color:"#22c55e" }}>{liveResult.herbicide}</span></div>
+            <div style={{ fontSize:9, color:"#334155" }}>Latency: <span style={{ color:tabColor }}>{liveResult.latency}</span></div>
+            <div style={{ fontSize:9, color:"#334155" }}>{liveResult.msg}</div>
+          </>
+        ) : (
+          <div style={{ fontSize:9, color:"#1e3a4a", animation:"pulse 1.5s infinite" }}>Waiting for first detection…</div>
+        )}
+        <button onClick={() => { stopWebcam(); reset(); }} style={{ marginLeft:"auto", padding:"5px 12px", background:"transparent", border:`1px solid #1e3a4a`, borderRadius:5, color:"#475569", fontSize:9, cursor:"pointer", fontFamily:"inherit" }}>STOP</button>
+        <button onClick={captureAndAnalyze} disabled={scanning} style={{ padding:"5px 14px", background:scanning?"#111":tabColor, border:"none", borderRadius:5, color:scanning?"#334155":"#020e11", fontSize:9, fontWeight:700, cursor:scanning?"default":"pointer", fontFamily:"inherit" }}>CAPTURE NOW</button>
+      </div>
+    </div>
+  );
+}
+
+
+// ── Splash screen ─────────────────────────────────────────────────────────────
+// Uses CSS animations only — immune to Chrome tab-throttling which
+// delays setTimeout by minutes when the tab loses focus during load.
+function SplashScreen({ onDone }) {
+  const onDoneRef = useRef(onDone);
+  useEffect(() => { onDoneRef.current = onDone; }, [onDone]);
+
+  // CSS animation fires onDone via animationend — no setTimeout needed
+  useEffect(() => {
+    const el = document.getElementById('ks-splash');
+    if (!el) return;
+    const handler = (e) => {
+      if (e.animationName === 'splashFadeOut') {
+        onDoneRef.current();
+      }
+    };
+    el.addEventListener('animationend', handler);
+    return () => el.removeEventListener('animationend', handler);
+  }, []);
   return (
     <>
       <style>{`
@@ -240,8 +483,11 @@ function SplashScreen({ onDone }) {
         @keyframes splashPulse { 0%,100%{opacity:0.35} 50%{opacity:0.85} }
         @keyframes bracketIn   { from{opacity:0;transform:scale(0.85)} to{opacity:1;transform:scale(1)} }
         @keyframes splashScan  { from{top:0px;opacity:1} to{top:210px;opacity:0} }
+        @keyframes splashFadeIn  { from{opacity:0} to{opacity:1} }
+        @keyframes splashFadeOut { from{opacity:1} to{opacity:0} }
+        @keyframes splashTextIn  { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
       `}</style>
-      <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#050808", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", opacity:outerOpacity, transition:"opacity 0.6s ease" }}>
+      <div id="ks-splash" style={{ position:"fixed", inset:0, zIndex:9999, background:"#050808", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", animation:"splashFadeIn 0.15s ease forwards, splashFadeOut 0.5s ease 1.9s forwards" }}>
         <svg style={{ position:"absolute", inset:0, width:"100%", height:"100%", opacity:0.045, pointerEvents:"none" }}>
           <defs><pattern id="dotgrid" width="32" height="32" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#06b6d4"/></pattern></defs>
           <rect width="100%" height="100%" fill="url(#dotgrid)"/>
@@ -251,23 +497,21 @@ function SplashScreen({ onDone }) {
         <div style={{ position:"relative", width:210, height:210 }}>
           <KhetiLogo size={210} spin={true}/>
           <div style={{ position:"absolute", left:-16, right:-16, top:0, height:2, background:"linear-gradient(90deg,transparent,#00e5aa44 10%,#06b6d4 40%,#00e5aa 50%,#06b6d4 60%,#00e5aa44 90%,transparent)", pointerEvents:"none", animation:"splashScan 0.55s ease-out 0.3s both" }}/>
-          {showText && (
-            <div style={{ animation:"bracketIn 0.4s ease" }}>
+          <div style={{ animation:"bracketIn 0.4s ease 0.8s both" }}>
               {[{top:-10,left:-10,borderTop:"1.5px solid #06b6d4",borderLeft:"1.5px solid #06b6d4"},{top:-10,right:-10,borderTop:"1.5px solid #06b6d4",borderRight:"1.5px solid #06b6d4"},{bottom:-10,left:-10,borderBottom:"1.5px solid #06b6d4",borderLeft:"1.5px solid #06b6d4"},{bottom:-10,right:-10,borderBottom:"1.5px solid #06b6d4",borderRight:"1.5px solid #06b6d4"}].map((s,i)=>(
                 <div key={i} style={{ position:"absolute", width:22, height:22, ...s }}/>
               ))}
             </div>
-          )}
         </div>
-        <div style={{ marginTop:28, textAlign:"center", opacity:showText?1:0, transform:showText?"translateY(0)":"translateY(12px)", transition:"all 0.55s cubic-bezier(0.16,1,0.3,1)" }}>
+        <div style={{ marginTop:28, textAlign:"center", animation:"splashTextIn 0.55s cubic-bezier(0.16,1,0.3,1) 0.8s both" }}>
           <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:900, fontSize:46, letterSpacing:"0.04em", color:"#f0fdff", textShadow:"0 0 40px rgba(6,182,212,0.35)" }}>
             KHETI<span style={{ color:"#06b6d4", fontWeight:300 }}>SENSE</span>
           </div>
-          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9, letterSpacing:"0.45em", color:"#164e63", marginTop:8, opacity:showSub?1:0, transition:"opacity 0.5s ease" }}>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9, letterSpacing:"0.45em", color:"#164e63", marginTop:8, animation:"splashTextIn 0.5s ease 1.1s both" }}>
             AI-POWERED PRECISION AGRICULTURE
           </div>
         </div>
-        {showSub && <div style={{ position:"absolute", bottom:52, fontFamily:"'IBM Plex Mono',monospace", fontSize:9, color:"#0e4a5a", letterSpacing:"0.18em", animation:"splashPulse 0.9s ease infinite" }}>INITIALIZING MISSION CONTROL…</div>}
+        <div style={{ position:"absolute", bottom:52, fontFamily:"'IBM Plex Mono',monospace", fontSize:9, color:"#0e4a5a", letterSpacing:"0.18em", animation:"splashPulse 0.9s ease 1.1s infinite" }}>INITIALIZING MISSION CONTROL…</div>
       </div>
     </>
   );
@@ -472,7 +716,7 @@ export default function Home() {
   const [splashDone, setSplashDone] = useState(false);
   const [activeTab,  setActiveTab]  = useState("weed");
   const [loading,    setLoading]    = useState(false);
-  const [results,    setResults]    = useState({ weed:null, tomato:null, pest:null, wheat:null, corn:null });
+  const [results,    setResults]    = useState({ weed:null, tomato:null, pest:null, wheat:null, corn:null, live:null });
   const [logs, setLogs] = useState([
     { time:"00:00:00", msg:"KhetiSense Core v2.1 online.",   type:"sys"  },
     { time:"00:00:01", msg:"U-Net (weed) loaded.",           type:"sys"  },
@@ -507,20 +751,45 @@ export default function Home() {
       navigator.geolocation.getCurrentPosition(({coords:{latitude:lat,longitude:lon}}) => res({lat,lon}), rej, { timeout:4000, maximumAge:60000 });
     });
     Promise.race([geo, new Promise((_,rej) => setTimeout(()=>rej("timeout"),4000))])
-      .then(({lat,lon}) => { setUserCoords({lat,lon}); addLog(`GPS fix: ${lat.toFixed(4)}°N ${lon.toFixed(4)}°E`,"sys"); fetchWeather(lat,lon); reverseGeocode(lat,lon); })
-      .catch(() => { addLog("Location unavailable. Using Karachi fallback.","error"); fetchWeather(FB.lat,FB.lon); setLocationName(FB.name); });
+      .then(({lat,lon}) => {
+        setUserCoords({lat,lon});
+        addLog(`GPS fix: ${lat.toFixed(4)}°N ${lon.toFixed(4)}°E`,"sys");
+        fetchWeather(lat,lon);       // fire and forget — non-blocking
+        reverseGeocode(lat,lon);     // fire and forget — non-blocking
+      })
+      .catch(() => {
+        addLog("Location unavailable. Using Karachi fallback.","error");
+        fetchWeather(FB.lat,FB.lon); // fire and forget — non-blocking
+        setLocationName("Karachi, PK");
+      });
   }, []);
 
   async function reverseGeocode(lat,lon) {
     try {
-      const j = await (await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`)).json();
+      // Hard 3s timeout — Nominatim can hang for minutes without this
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      const j = await res.json();
       const city = j.address?.city||j.address?.town||j.address?.village||j.address?.county||"Unknown";
       setLocationName(`${city}, ${j.address?.country_code?.toUpperCase()??""}`);
-    } catch { setLocationName("Unknown"); }
+    } catch { setLocationName(`${lat.toFixed(2)}°N ${lon.toFixed(2)}°E`); }
   }
   async function fetchWeather(lat,lon) {
     try {
-      const j = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&wind_speed_unit=ms`)).json();
+      // Hard 5s timeout on weather fetch
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&wind_speed_unit=ms`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      const j = await res.json();
       const c = j.current;
       setWeather({ temp:Math.round(c.temperature_2m), humidity:c.relative_humidity_2m, wind:c.wind_speed_10m.toFixed(1), code:c.weather_code });
       addLog(`Weather: ${Math.round(c.temperature_2m)}°C, ${wmoDescription(c.weather_code)}.`,"sys");
@@ -683,6 +952,15 @@ export default function Home() {
                   </label>
                 </div>
               </div>
+            ) : activeTab === "live" ? (
+              <LiveScanTab
+                tabColor={tab.color}
+                apiBase={API}
+                onResult={(data) => {
+                  setResults(r => ({ ...r, live:data }));
+                  addLog(`[LIVE] Weed: ${data.percentage}% — ${data.severity}`, "result");
+                }}
+              />
             ) : result && activeTab!=="weed" ? (
               <YoloResult result={result} tabColor={tab.color} onRescan={e=>handleUpload(e,activeTab)}/>
             ) : (
